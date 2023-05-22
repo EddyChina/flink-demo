@@ -9,7 +9,6 @@ import org.apache.doris.flink.cfg.DorisOptions;
 import org.apache.doris.flink.cfg.DorisReadOptions;
 import org.apache.doris.flink.sink.DorisSink;
 import org.apache.doris.flink.sink.writer.SimpleStringSerializer;
-import org.apache.flink.api.common.RuntimeExecutionMode;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
@@ -40,7 +39,7 @@ public class ShowCreateTableTask {
 
         StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
         env.enableCheckpointing(30000);
-        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
+//        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
         DataStreamSource<String> dataStreamSource = env.fromSource(mySqlSource, WatermarkStrategy.noWatermarks(), "Flink CDC MySql Source");
 
@@ -54,25 +53,36 @@ public class ShowCreateTableTask {
 
                 String op = rowJson.getString("op");
                 JSONObject source = rowJson.getJSONObject("source");
-                String sourceTable = source.getString("sourceTable");
+                String sourceTable = source.getString("table");
                 String sourceDB = source.getString("db");
 
                 String table = sourceDB + "_" + sourceTable;
 
-                outputTagMap.putIfAbsent(table, new OutputTag<String>(table){});
+                outputTagMap.computeIfAbsent(table, compute -> {
+                    OutputTag<String> outputTag = new OutputTag<String>(table) {
+                    };
+
+                    log.info("OutputTag Init.  table[{}] -> OutputTagId[{}]", table, outputTag.getId());
+                    return outputTag;
+                });
 
                 //only sync insert
                 if ("c".equals(op)) {
                     String value = rowJson.getJSONObject("after").toJSONString();
+
+                    log.info("context.outputTag=[{}]", outputTagMap.get(table));
                     context.output(outputTagMap.get(table), value);
                 }
             }
         });
 
-        outputTagMap.forEach((key, value) -> process.getSideOutput(value).sinkTo(buildDorisSink(key)));
+        log.info("outputTagMap=[{}]", JSON.toJSONString(outputTagMap));
 
-//        process.getSideOutput(tableA).sinkTo(buildDorisSink(TABLE_A));
-//        process.getSideOutput(tableB).sinkTo(buildDorisSink(TABLE_B));
+        outputTagMap.forEach((key, value) -> {
+            log.info("Processing.  table[{}] -> OutputTagId[{}]", key, value.getId());
+
+            process.getSideOutput(value).sinkTo(buildDorisSink(key));
+        });
 
         env.execute("Full Database Sync ");
     }
@@ -90,7 +100,7 @@ public class ShowCreateTableTask {
         //json data format
         pro.setProperty("format", "json");
         pro.setProperty("read_json_by_line", "true");
-        pro.setProperty("sink.enable-delete", "true");
+
         DorisExecutionOptions executionOptions = DorisExecutionOptions.builder()
                 .setDeletable(true)
                 .setLabelPrefix("cdctest-" + System.currentTimeMillis()) //streamload label prefix,
