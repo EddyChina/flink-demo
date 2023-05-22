@@ -10,6 +10,7 @@ import org.apache.doris.flink.cfg.DorisReadOptions;
 import org.apache.doris.flink.sink.DorisSink;
 import org.apache.doris.flink.sink.writer.SimpleStringSerializer;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
+import org.apache.flink.configuration.Configuration;
 import org.apache.flink.streaming.api.datastream.DataStreamSource;
 import org.apache.flink.streaming.api.datastream.SingleOutputStreamOperator;
 import org.apache.flink.streaming.api.environment.StreamExecutionEnvironment;
@@ -19,9 +20,7 @@ import org.apache.flink.util.OutputTag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-import java.util.HashMap;
-import java.util.Map;
-import java.util.Properties;
+import java.util.*;
 
 public class ShowCreateTableTask {
     private static final Logger log = LoggerFactory.getLogger(ShowCreateTableTask.class);
@@ -32,6 +31,7 @@ public class ShowCreateTableTask {
                 .port(3306)
                 .username("root")
                 .password("mysql8")
+                .serverTimeZone("+08:00")
                 .databaseList("tcg_loyalty", "tcg_identity")
                 .tableList("tcg_loyalty.*", "tcg_identity.*")
                 .deserializer(new JsonDebeziumDeserializationSchema())
@@ -41,11 +41,17 @@ public class ShowCreateTableTask {
         env.enableCheckpointing(30000);
 //        env.setRuntimeMode(RuntimeExecutionMode.BATCH);
 
+        Set<String> tableList = new HashSet<>();
+
         DataStreamSource<String> dataStreamSource = env.fromSource(mySqlSource, WatermarkStrategy.noWatermarks(), "Flink CDC MySql Source");
-
-        Map<String, OutputTag<String>> outputTagMap = new HashMap<>();
-
         SingleOutputStreamOperator<String> process = dataStreamSource.process(new ProcessFunction<String, String>() {
+            private transient Map<String, OutputTag<String>> outputTagMap;
+            @Override
+            public void open(Configuration parameters) throws Exception {
+                outputTagMap = new HashMap<>();
+                super.open(parameters);
+            }
+
             @Override
             public void processElement(String row, ProcessFunction<String, String>.Context context, Collector<String> collector) {
                 log.info("row-> [{}]", row);
@@ -57,31 +63,29 @@ public class ShowCreateTableTask {
                 String sourceDB = source.getString("db");
 
                 String table = sourceDB + "_" + sourceTable;
+                tableList.add(table);
 
-                outputTagMap.computeIfAbsent(table, compute -> {
+                String value = rowJson.getJSONObject("after").toJSONString();
+                context.output(outputTagMap.computeIfAbsent(table, compute -> {
                     OutputTag<String> outputTag = new OutputTag<String>(table) {
                     };
 
-                    log.info("OutputTag Init.  table[{}] -> OutputTagId[{}]", table, outputTag.getId());
+                    log.info("OutputTag Init.  table[{}] -> OutputTagId[{}]", table, outputTag);
                     return outputTag;
-                });
+                }), value);
 
-                //only sync insert
-                if ("c".equals(op)) {
-                    String value = rowJson.getJSONObject("after").toJSONString();
-
-                    log.info("context.outputTag=[{}]", outputTagMap.get(table));
-                    context.output(outputTagMap.get(table), value);
-                }
+                log.info("context.outputTag=[{}], outputTagMap=[{}]", outputTagMap.get(table), outputTagMap);
             }
         });
 
-        log.info("outputTagMap=[{}]", JSON.toJSONString(outputTagMap));
-
-        outputTagMap.forEach((key, value) -> {
-            log.info("Processing.  table[{}] -> OutputTagId[{}]", key, value.getId());
-
-            process.getSideOutput(value).sinkTo(buildDorisSink(key));
+        tableList.forEach(table -> {
+            try {
+                log.info("Processing.  table[{}]]", table);
+                process.getSideOutput(new OutputTag<String>(table)).sinkTo(buildDorisSink(table)).name(table);
+                log.info("Sinking.  table[{}]]", table);
+            } catch (Exception e) {
+                e.printStackTrace();
+            }
         });
 
         env.execute("Full Database Sync ");
